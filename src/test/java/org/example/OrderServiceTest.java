@@ -95,8 +95,8 @@ class OrderServiceTest {
         assertEquals(new BigDecimal("155000.00"), result.totalAmount());
         var sequence = inOrder(carts, foods, orders);
         sequence.verify(carts).getItemsForCheckout(4);
-        sequence.verify(foods).reserveStock(5, 1);
         sequence.verify(foods).reserveStock(1, 2);
+        sequence.verify(foods).reserveStock(5, 1);
         sequence.verify(orders).save(any());
         sequence.verify(carts).clearCart(4);
     }
@@ -177,6 +177,7 @@ class OrderServiceTest {
 
     @Test void ownershipIsCheckedBeforeAnyMutation() {
         when(orders.findById(1001L)).thenReturn(Optional.of(order(OrderType.DELIVERY, OrderStatus.PENDING)));
+        when(orders.findByIdForUpdate(1001L)).thenReturn(Optional.of(order(OrderType.DELIVERY, OrderStatus.PENDING)));
         assertCode("FORBIDDEN", () -> service.get(5, Role.CUSTOMER, 1001));
         assertCode("FORBIDDEN", () -> service.cancel(5, 1001));
         assertEquals(1001L, service.get(CUSTOMER, Role.CUSTOMER, 1001).id());
@@ -201,7 +202,7 @@ class OrderServiceTest {
                     if (next == OrderStatus.PENDING) continue;
                     var existing = order(type, current);
                     Long confirmedBefore = existing.getConfirmedBy();
-                    when(orders.findById(1001L)).thenReturn(Optional.of(existing));
+                    when(orders.findByIdForUpdate(1001L)).thenReturn(Optional.of(existing));
                     boolean allowed = (current == OrderStatus.PENDING && (next == OrderStatus.CONFIRMED || next == OrderStatus.CANCELLED))
                             || (current == OrderStatus.CONFIRMED && (next == OrderStatus.PROCESSING || next == OrderStatus.CANCELLED))
                             || (current == OrderStatus.PROCESSING && (next == OrderStatus.CANCELLED
@@ -217,6 +218,10 @@ class OrderServiceTest {
                         } else assertEquals(confirmedBefore, result.confirmedBy());
                         if (next == OrderStatus.CANCELLED) assertEquals(NOW, result.cancelledAt());
                         if (next == OrderStatus.COMPLETED) assertEquals(NOW, result.completedAt());
+                    } else if (current == OrderStatus.CANCELLED && next == OrderStatus.CANCELLED) {
+                        var replay = service.updateStatus(EMPLOYEE, 1001, next);
+                        assertEquals(existing.getCancelledAt(), replay.cancelledAt());
+                        assertEquals(existing.getUpdatedAt(), replay.updatedAt());
                     } else {
                         assertCode("INVALID_ORDER_TRANSITION", () -> service.updateStatus(EMPLOYEE, 1001, next));
                         assertEquals(current, existing.getStatus());
@@ -228,33 +233,34 @@ class OrderServiceTest {
     }
 
     @Test void confirmIsPendingToConfirmedOnly() {
-        when(orders.findById(1001L)).thenReturn(Optional.of(order(OrderType.DINE_IN, OrderStatus.PENDING)));
+        when(orders.findByIdForUpdate(1001L)).thenReturn(Optional.of(order(OrderType.DINE_IN, OrderStatus.PENDING)));
         var confirmed = service.confirm(EMPLOYEE, 1001);
         assertEquals(OrderStatus.CONFIRMED, confirmed.status());
         assertEquals(2L, confirmed.confirmedBy());
-        when(orders.findById(1001L)).thenReturn(Optional.of(order(OrderType.DINE_IN, OrderStatus.CONFIRMED)));
+        when(orders.findByIdForUpdate(1001L)).thenReturn(Optional.of(order(OrderType.DINE_IN, OrderStatus.CONFIRMED)));
         assertCode("INVALID_ORDER_TRANSITION", () -> service.confirm(EMPLOYEE, 1001));
     }
 
-    @Test void customerCanOnlyCancelPendingAndStockIsRestoredOnceInItemOrder() {
+    @Test void customerCanOnlyCancelPendingAndStockIsRestoredOnceInFoodIdOrder() {
         var pending = order(OrderType.DELIVERY, OrderStatus.PENDING);
         pending.getItems().add(OrderItem.builder().order(pending).foodId(3L).foodName("Trà")
                 .unitPrice(new BigDecimal("25000.00")).quantity(1).build());
         pending.getItems().addFirst(OrderItem.builder().order(pending).foodId(7L).foodName("Chè")
                 .unitPrice(new BigDecimal("30000.00")).quantity(4).build());
-        when(orders.findById(1001L)).thenReturn(Optional.of(pending));
+        when(orders.findByIdForUpdate(1001L)).thenReturn(Optional.of(pending));
         var cancelled = service.cancel(CUSTOMER, 1001);
         assertEquals(OrderStatus.CANCELLED, cancelled.status());
         assertNull(cancelled.confirmedBy());
         assertEquals(NOW, cancelled.cancelledAt());
         var sequence = inOrder(foods);
-        sequence.verify(foods).releaseStock(7, 4);
         sequence.verify(foods).releaseStock(1, 2);
         sequence.verify(foods).releaseStock(3, 1);
+        sequence.verify(foods).releaseStock(7, 4);
 
-        assertCode("INVALID_ORDER_TRANSITION", () -> service.cancel(CUSTOMER, 1001));
+        assertEquals(cancelled, service.cancel(CUSTOMER, 1001));
+        assertCode("FORBIDDEN", () -> service.cancel(5, 1001));
         for (var status : List.of(OrderStatus.CONFIRMED, OrderStatus.PROCESSING, OrderStatus.SHIPPING, OrderStatus.COMPLETED)) {
-            when(orders.findById(1001L)).thenReturn(Optional.of(order(OrderType.DELIVERY, status)));
+            when(orders.findByIdForUpdate(1001L)).thenReturn(Optional.of(order(OrderType.DELIVERY, status)));
             assertCode("INVALID_ORDER_TRANSITION", () -> service.cancel(CUSTOMER, 1001));
         }
         verify(foods, times(1)).releaseStock(1, 2);

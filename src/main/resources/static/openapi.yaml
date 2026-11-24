@@ -410,15 +410,15 @@ paths:
       description: >-
         Chỉ CUSTOMER. Kiểm tra quy tắc orderType trước khi đọc giỏ; sai trả 400
         VALIDATION_ERROR. Sau đó chưa có giỏ hoặc giỏ rỗng trả 400 EMPTY_CART.
-        Trong một transaction: đọc giỏ theo thứ tự dòng, kiểm tra ACTIVE và tồn
-        kho từng món, trừ kho, lưu đơn PENDING với snapshot tên/giá hiện tại từ
-        server, rồi dọn giỏ (giữ ID giỏ). Bất kỳ lỗi nào đều rollback toàn bộ.
+        Trong một transaction: lấy khóa theo khách, đọc giỏ, trừ kho có điều kiện
+        ACTIVE và đủ tồn kho theo ID món tăng dần, lưu đơn PENDING với snapshot
+        tên/giá từ server, rồi dọn giỏ (giữ ID giỏ). Lỗi trước commit rollback toàn bộ.
         Món không tồn tại trả 404 FOOD_NOT_FOUND, INACTIVE trả 409 FOOD_UNAVAILABLE,
         thiếu kho trả 409 INSUFFICIENT_STOCK. Không có phí giao hàng/thuế trong tổng.
         paymentMethod chỉ ghi nhận phương thức, không thực hiện thanh toán.
         Chưa có idempotency key: gửi lại sau khi giỏ đã dọn trả EMPTY_CART.
-        Phase 1 không khóa hàng; checkout đồng thời có thể bán vượt kho hoặc tạo
-        đơn trùng từ cùng giỏ. Deadlock/hết thời gian chờ khóa trả 409 CONCURRENT_UPDATE;
+        Checkout và mọi thao tác ghi giỏ của cùng khách dùng chung khóa hàng.
+        Deadlock/hết thời gian chờ khóa trả 409 CONCURRENT_UPDATE;
         server không tự retry.
       security:
         - bearerAuth: []
@@ -548,11 +548,10 @@ paths:
       summary: CUSTOMER hủy đơn PENDING của mình
       description: >-
         Chỉ CUSTOMER. Đơn không tồn tại trả 404 ORDER_NOT_FOUND; đơn của người
-        khác trả 403 FORBIDDEN. Chỉ PENDING được chuyển sang CANCELLED; các trạng
-        thái khác, kể cả đã CANCELLED, trả 409 INVALID_ORDER_TRANSITION. Hoàn kho
-        từng dòng (kể cả món INACTIVE), ghi cancelledAt/updatedAt trong cùng
-        transaction; giữ bản ghi đơn và snapshot món. Trả 200 với đơn sau hủy.
-        Phase 1 chưa chống hai yêu cầu hủy đồng thời hoàn kho hai lần.
+        khác trả 403 FORBIDDEN. Chỉ PENDING được chuyển sang CANCELLED. Đơn đã
+        CANCELLED trả 200 với dữ liệu đã lưu. Các trạng thái còn lại trả 409
+        INVALID_ORDER_TRANSITION. Lần chuyển sang CANCELLED hoàn kho từng dòng
+        (kể cả món INACTIVE) và ghi cancelledAt/updatedAt trong cùng transaction.
       security:
         - bearerAuth: []
       responses:
@@ -614,12 +613,13 @@ paths:
         - SHIPPING → COMPLETED; COMPLETED/CANCELLED không chuyển tiếp.
 
         status=PENDING luôn trả 400 VALIDATION_ERROR, trước khi tìm đơn.
-        Bước chuyển khác không hợp lệ, kể cả gửi lại trạng thái hiện tại, trả
-        409 INVALID_ORDER_TRANSITION; đơn không tồn tại trả 404 ORDER_NOT_FOUND.
+        Gửi lại CANCELLED cho đơn đã hủy trả 200 với dữ liệu đã lưu. Bước chuyển
+        không hợp lệ khác trả 409 INVALID_ORDER_TRANSITION. Đơn không tồn tại
+        trả 404 ORDER_NOT_FOUND.
         Chuyển CONFIRMED ghi confirmedBy/confirmedAt như route confirm; mọi lần
         chuyển cập nhật updatedAt, COMPLETED ghi completedAt, CANCELLED ghi
         cancelledAt và hoàn kho trong cùng transaction. Không hủy được SHIPPING.
-        Phase 1 chưa chống hoàn kho hai lần khi hủy đồng thời.
+        Mọi thao tác chuyển trạng thái lấy khóa trên cùng hàng đơn trước khi kiểm tra.
       security:
         - bearerAuth: []
       requestBody:
@@ -816,7 +816,8 @@ components:
       description: >-
         ACCOUNT_CONFLICT (đăng ký), FOOD_NAME_CONFLICT (tạo/sửa món),
         FOOD_UNAVAILABLE (thêm giỏ/checkout), INSUFFICIENT_STOCK (checkout),
-        INVALID_ORDER_TRANSITION (xử lý đơn), CONFLICT (ràng buộc DB, gồm UNIQUE/FK/CHECK),
+        INVALID_ORDER_TRANSITION (xử lý đơn), STOCK_RESTORE_CONFLICT (hoàn kho vượt giới hạn),
+        CONFLICT (ràng buộc DB, gồm UNIQUE/FK/CHECK),
         CONCURRENT_UPDATE (deadlock/hết thời gian chờ khóa; transaction rollback,
         có thể gửi lại; server không tự retry).
       content:

@@ -7,6 +7,7 @@ import static org.mockito.Mockito.*;
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.Optional;
+import org.example.dto.FoodDto;
 import org.example.common.BusinessException;
 import org.example.dto.FoodRequest;
 import org.example.entity.Food;
@@ -33,6 +34,15 @@ class FoodServiceTest {
                 .stockQuantity(stock).status(status).build();
     }
 
+    private void stubStockRead(long id, int stock, String status) {
+        var row = mock(FoodRepository.FoodSnapshot.class);
+        when(row.getName()).thenReturn("Phở");
+        when(row.getStatus()).thenReturn(status);
+        when(row.getStockQuantity()).thenReturn(stock);
+        when(row.toDto()).thenReturn(FoodDto.fromEntity(food(id, stock, status)));
+        when(foods.readForStockUpdate(id)).thenReturn(Optional.of(row));
+    }
+
     private static void assertError(BusinessException.Type type, String code, org.junit.jupiter.api.function.Executable action) {
         var error = assertThrows(BusinessException.class, action);
         assertEquals(type, error.type());
@@ -41,7 +51,7 @@ class FoodServiceTest {
 
     @Test void updateWithoutStockOrStatusKeepsCurrentValues() {
         var food = food(7, 25, "INACTIVE");
-        when(foods.findById(7L)).thenReturn(Optional.of(food));
+        when(foods.findByIdForUpdate(7L)).thenReturn(Optional.of(food));
         when(categories.existsById(1L)).thenReturn(true);
 
         var result = service.updateFood(7L, request("Phở bò"));
@@ -54,7 +64,7 @@ class FoodServiceTest {
 
     @Test void updateChecksFoodCategoryAndNameOfOtherFoods() {
         assertError(BusinessException.Type.NOT_FOUND, "FOOD_NOT_FOUND", () -> service.updateFood(7L, request("Phở")));
-        when(foods.findById(7L)).thenReturn(Optional.of(food(7, 25, "ACTIVE")));
+        when(foods.findByIdForUpdate(7L)).thenReturn(Optional.of(food(7, 25, "ACTIVE")));
         assertError(BusinessException.Type.NOT_FOUND, "CATEGORY_NOT_FOUND", () -> service.updateFood(7L, request(2L, "Phở")));
         when(categories.existsById(1L)).thenReturn(true);
         when(foods.existsByNameAndIdNot("Phở Gà", 7L)).thenReturn(true);
@@ -64,7 +74,7 @@ class FoodServiceTest {
 
     @Test void deleteOnlyStopsSelling() {
         var food = food(7, 25, "ACTIVE");
-        when(foods.findById(7L)).thenReturn(Optional.of(food));
+        when(foods.findByIdForUpdate(7L)).thenReturn(Optional.of(food));
         service.deleteFood(7L);
         assertEquals("INACTIVE", food.getStatus());
         verify(foods, never()).delete(any());
@@ -117,23 +127,22 @@ class FoodServiceTest {
     }
 
     @Test void reserveStockChecksAndDecrements() {
-        var food = food(1, 5, "ACTIVE");
-        when(foods.findById(1L)).thenReturn(Optional.of(food));
+        when(foods.decreaseStock(1, 5)).thenReturn(1);
+        stubStockRead(1, 0, "ACTIVE");
         var snapshot = service.reserveStock(1, 5);
-        assertEquals(0, food.getStockQuantity());
+        assertEquals(0, snapshot.stockQuantity());
         assertEquals("Phở", snapshot.name());
         assertEquals(new BigDecimal("40000.00"), snapshot.price());
         assertError(BusinessException.Type.CONFLICT, "INSUFFICIENT_STOCK", () -> service.reserveStock(1, 1));
-        assertEquals(0, food.getStockQuantity());
 
-        when(foods.findById(2L)).thenReturn(Optional.of(food(2, 5, "INACTIVE")));
+        stubStockRead(2, 5, "INACTIVE");
         assertError(BusinessException.Type.CONFLICT, "FOOD_UNAVAILABLE", () -> service.reserveStock(2, 1));
         assertError(BusinessException.Type.NOT_FOUND, "FOOD_NOT_FOUND", () -> service.reserveStock(3, 1));
     }
 
     @Test void checkoutErrorsNameTheFood() {
-        when(foods.findById(1L)).thenReturn(Optional.of(food(1, 0, "ACTIVE")));
-        when(foods.findById(2L)).thenReturn(Optional.of(food(2, 5, "INACTIVE")));
+        stubStockRead(1, 0, "ACTIVE");
+        stubStockRead(2, 5, "INACTIVE");
         assertEquals("Món \"Phở\" không đủ tồn kho.",
                 assertThrows(BusinessException.class, () -> service.reserveStock(1, 1)).getMessage());
         assertEquals("Món \"Phở\" đã ngừng bán.",
@@ -141,10 +150,9 @@ class FoodServiceTest {
     }
 
     @Test void releaseStockRestoresEvenForInactiveFood() {
-        var food = food(2, 1, "INACTIVE");
-        when(foods.findById(2L)).thenReturn(Optional.of(food));
+        when(foods.increaseStock(2, 3, Integer.MAX_VALUE - 3)).thenReturn(1);
         service.releaseStock(2, 3);
-        assertEquals(4, food.getStockQuantity());
+        verify(foods).increaseStock(2, 3, Integer.MAX_VALUE - 3);
         assertError(BusinessException.Type.NOT_FOUND, "FOOD_NOT_FOUND", () -> service.releaseStock(3, 1));
     }
 }

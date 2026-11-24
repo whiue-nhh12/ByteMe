@@ -109,25 +109,25 @@ sequenceDiagram
             Order-->>Customer: 400 VALIDATION_ERROR (chưa có truy vấn DB nào)
         else Hợp lệ
             Order->>Cart: getItemsForCheckout(customerId)
-            Cart->>DB: SELECT carts WHERE user_id = ?, rồi đọc cart_items
+            Cart->>DB: Khóa hàng users theo customerId, rồi đọc giỏ
             Cart-->>Order: foodId → quantity theo thứ tự dòng giỏ (rỗng nếu chưa có giỏ)
             alt Chưa có giỏ hoặc giỏ rỗng
                 Order-->>Customer: 400 EMPTY_CART (rollback)
             else Có món
-                loop Mỗi món theo thứ tự dòng giỏ
+                loop Mỗi món theo foodId tăng dần
                     Order->>Food: reserveStock(foodId, quantity)
-                    Food->>DB: SELECT foods WHERE id = ? (không khóa hàng)
+                    Food->>DB: UPDATE foods WHERE id = ? AND ACTIVE AND stock đủ
                     alt Không có món / ngừng bán / thiếu kho
                         Food-->>Customer: 404 FOOD_NOT_FOUND / 409 FOOD_UNAVAILABLE / 409 INSUFFICIENT_STOCK (rollback toàn bộ)
                     else Đủ điều kiện
-                        Food->>Food: giảm stockQuantity (ghi xuống DB khi flush)
+                        Food->>DB: Đọc snapshot tên và giá của hàng đã cập nhật
                         Food-->>Order: tên + giá hiện tại (snapshot)
                     end
                 end
                 Order->>Repo: save(Order PENDING + OrderItem snapshot)
                 Repo->>DB: INSERT orders, order_items
                 Order->>Cart: clearCart(customerId)
-                Cart->>DB: flush: UPDATE foods (stock), DELETE cart_items
+                Cart->>DB: DELETE cart_items khi flush
                 Order->>DB: COMMIT
                 Order-->>API: OrderDto (items, totalAmount)
                 API-->>Customer: 201 Created + Location /api/orders/{id}
@@ -140,15 +140,7 @@ Giá và tổng tiền do server tính từ dữ liệu món đọc trong transa
 
 Giỏ được tạo ở lần thêm món đầu tiên (`addToCart`). `GET /api/cart` khi chưa có giỏ trả `200` với `id: null`, `items: []` và không ghi gì vào database. Sửa/xóa dòng giỏ khi chưa có giỏ trả `404 CART_ITEM_NOT_FOUND`.
 
-Pháe 1 hiện tại có một số hạn chế:
-
-- Checkout đồng thời có thể bán vượt kho (lost update): hai transaction cùng đọc một giá trị tồn kho, cùng kiểm tra đủ kho rồi cùng ghi `stock - quantity`, nên tổng số đã bán vượt tồn kho; `stock_quantity` không bị âm vì service chỉ ghi khi tồn kho đọc được ≥ số lượng. Hai checkout cùng một giỏ không được tuần tự hóa: request sau có thể tạo đơn thứ hai hoặc lỗi thay vì nhận `400 EMPTY_CART`.
-- Hai yêu cầu hủy cùng một đơn chạy đồng thời có thể cùng thấy trạng thái cũ và hoàn kho hai lần.
-- Admin sửa món đồng thời với checkout có thể ghi đè tồn kho (lost update).
-- Khách thêm món trong lúc checkout: số lượng cộng thêm vào một dòng giỏ đang được checkout có thể bị dọn mất mà không vào đơn.
-- Checkout đồng thời trên cùng món dễ deadlock: insert `order_items` lấy khóa S trên hàng `foods` (FK), sau đó `UPDATE foods` cần khóa X. InnoDB rollback một transaction; `GlobalErrors` đổi `PessimisticLockingFailureException` thành `409 CONCURRENT_UPDATE` (client gửi lại). Sắp xếp thứ tự món không đủ để tránh trường hợp này.
-
-Ràng buộc UNIQUE vẫn còn: hai lần thêm món đầu tiên đồng thời cùng tạo giỏ thì request vi phạm `carts.user_id` nhận `409 CONFLICT`. Các điểm trên để dành cho phase 2 (khóa hàng/khóa lạc quan hoặc cơ chế tương đương) và là mục tiêu đo trước/sau cải tiến trên Kaggle.
+Checkout và các thao tác ghi giỏ dùng chung khóa hàng `users`, kể cả lần đầu tạo giỏ. Admin lấy khóa ghi hàng `foods` trước khi đọc để sửa hoặc ngừng bán món. Khi admin truyền `stockQuantity`, giá trị đó là mức tồn kho tuyệt đối tại thời điểm cập nhật. MySQL có thể vẫn báo tranh chấp khóa và ứng dụng trả `409 CONCURRENT_UPDATE`. Xem [khảo sát trước cải tiến](phase2/checkout-before.md) để đối chiếu hành vi Pha 1.
 
 ## Sequence hủy đơn (UC15, UC17)
 
@@ -163,17 +155,17 @@ sequenceDiagram
 
     User->>API: DELETE /api/orders/{id} (CUSTOMER) hoặc PUT status CANCELLED (EMPLOYEE)
     API->>Order: cancel(customerId, id) / updateStatus(employeeId, id, CANCELLED)
-    Order->>DB: SELECT orders WHERE id = ?
+    Order->>DB: SELECT orders WHERE id = ? FOR UPDATE
     Order->>Order: Kiểm tra tồn tại (404), chủ đơn với khách (403), bước chuyển hợp lệ (409)
-    loop Mỗi dòng đơn theo thứ tự trong đơn
+    loop Mỗi dòng đơn theo foodId tăng dần
         Order->>Food: releaseStock(foodId, quantity)
-        Food->>DB: SELECT foods WHERE id = ?, rồi tăng stock
+        Food->>DB: UPDATE foods SET stock = stock + quantity
     end
     Order->>DB: COMMIT (UPDATE foods, UPDATE orders status = CANCELLED, cancelled_at, updated_at)
     Order-->>User: 200 + đơn sau khi hủy (giữ đơn và chi tiết làm lịch sử)
 ```
 
-`CANCELLED` là trạng thái cuối nên hủy lần hai (tuần tự) nhận `409 INVALID_ORDER_TRANSITION` và không hoàn kho lại. Phase 1 không khóa đơn, nên hai yêu cầu hủy **đồng thời** vẫn có thể hoàn kho hai lần (xem [Giới hạn phase 1](#giới-hạn-phase-1)). Hoàn kho áp dụng cả cho món đã ngừng bán.
+`cancel`, `confirm` và `updateStatus` dùng chung khóa hàng Order. Sau khi kiểm quyền, yêu cầu hủy đơn đã `CANCELLED` trả `200` với đơn đã lưu và giữ nguyên kho lẫn timestamp. Hoàn kho áp dụng cả cho món đã ngừng bán.
 
 ## Trạng thái theo hình thức phục vụ
 

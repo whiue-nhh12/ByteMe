@@ -295,7 +295,7 @@ def run():
     check("Order price remains unchanged", snapshot["totalAmount"] == 50000, 50000, snapshot["totalAmount"])
     http("Cancel pending order", "DELETE", f"/api/orders/{order_id}", 200, token=TOKENS["a"])
     check("Cancellation restores stock", stock(primary) == 20, 20, stock(primary))
-    http("Repeated cancellation rejected", "DELETE", f"/api/orders/{order_id}", 409, token=TOKENS["a"], code="INVALID_ORDER_TRANSITION")
+    http("Repeated cancellation returns the cancelled order", "DELETE", f"/api/orders/{order_id}", 200, token=TOKENS["a"])
     check("Cancellation cannot restore twice", stock(primary) == 20, 20, stock(primary))
     for serving in [DINE, DELIVERY]:
         clear("a")

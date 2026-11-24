@@ -1,17 +1,24 @@
 package org.example.repository;
 
+import jakarta.persistence.LockModeType;
 import org.example.entity.OrderStatus;
 import org.example.entity.OrderType;
 import org.example.entity.Order;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 
 public interface OrderRepository extends JpaRepository<Order, Long> {
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select o from Order o where o.id = :id")
+    Optional<Order> findByIdForUpdate(long id);
+
     // Null owner or type disables that filter.
     String FILTER = """
             from Order o

@@ -74,7 +74,7 @@ public class FoodService {
 
     @Transactional
     public FoodDto updateFood(Long id, FoodRequest request) {
-        Food food = findFood(id);
+        Food food = foodRepository.findByIdForUpdate(id).orElseThrow(FoodService::foodNotFound);
         requireCategory(request.categoryId());
 
         String name = request.name().trim();
@@ -94,7 +94,7 @@ public class FoodService {
 
     @Transactional
     public void deleteFood(Long id) {
-        findFood(id).setStatus("INACTIVE");
+        foodRepository.findByIdForUpdate(id).orElseThrow(FoodService::foodNotFound).setStatus("INACTIVE");
     }
 
 
@@ -115,19 +115,27 @@ public class FoodService {
 
     @Transactional
     public FoodDto reserveStock(long id, int quantity) {
-        Food food = findFood(id);
-        requireActive(food);
+        requirePositiveQuantity(quantity);
+        int updated = foodRepository.decreaseStock(id, quantity);
+        var food = foodRepository.readForStockUpdate(id).orElseThrow(FoodService::foodNotFound);
+        if (updated == 1) return food.toDto();
+        requireActive(food.getStatus(), food.getName());
         if (food.getStockQuantity() < quantity) {
             throw BusinessException.conflict("INSUFFICIENT_STOCK", "Món \"" + food.getName() + "\" không đủ tồn kho.");
         }
-        food.setStockQuantity(food.getStockQuantity() - quantity);
-        return FoodDto.fromEntity(food);
+        throw BusinessException.conflict("CONCURRENT_UPDATE", "Tồn kho vừa được cập nhật, vui lòng thử lại.");
     }
 
     @Transactional
     public void releaseStock(long id, int quantity) {
-        Food food = findFood(id);
-        food.setStockQuantity(food.getStockQuantity() + quantity);
+        requirePositiveQuantity(quantity);
+        if (foodRepository.increaseStock(id, quantity, Integer.MAX_VALUE - quantity) == 1) return;
+        foodRepository.readForStockUpdate(id).orElseThrow(FoodService::foodNotFound);
+        throw BusinessException.conflict("STOCK_RESTORE_CONFLICT", "Không thể hoàn số lượng món vào tồn kho.");
+    }
+
+    private static void requirePositiveQuantity(int quantity) {
+        if (quantity <= 0) throw BusinessException.invalid("VALIDATION_ERROR", "Số lượng phải lớn hơn 0.");
     }
 
     private Food findFood(long id) {
@@ -141,8 +149,12 @@ public class FoodService {
     }
 
     private static void requireActive(Food food) {
-        if (!ACTIVE.equals(food.getStatus())) {
-            throw BusinessException.conflict("FOOD_UNAVAILABLE", "Món \"" + food.getName() + "\" đã ngừng bán.");
+        requireActive(food.getStatus(), food.getName());
+    }
+
+    private static void requireActive(String status, String name) {
+        if (!ACTIVE.equals(status)) {
+            throw BusinessException.conflict("FOOD_UNAVAILABLE", "Món \"" + name + "\" đã ngừng bán.");
         }
     }
 

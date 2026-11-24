@@ -15,6 +15,8 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -51,9 +53,12 @@ public class OrderService {
                 .createdAt(now)
                 .updatedAt(now)
                 .build();
-        // Reserve stock and snapshot each item.
+        // Acquire food locks in ID order while preserving the cart order in the response.
+        Map<Long, FoodDto> snapshots = new HashMap<>();
+        cart.entrySet().stream().sorted(Map.Entry.comparingByKey()).forEach(item ->
+                snapshots.put(item.getKey(), foodService.reserveStock(item.getKey(), item.getValue())));
         cart.forEach((foodId, quantity) -> {
-            FoodDto food = foodService.reserveStock(foodId, quantity);
+            FoodDto food = snapshots.get(foodId);
             order.getItems().add(OrderItem.builder()
                     .order(order)
                     .foodId(foodId)
@@ -95,8 +100,9 @@ public class OrderService {
 
     @Transactional
     public OrderDto cancel(long customerId, long orderId) {
-        Order order = orders.findById(orderId).orElseThrow(OrderService::orderNotFound);
+        Order order = orders.findByIdForUpdate(orderId).orElseThrow(OrderService::orderNotFound);
         requireOwner(order, customerId);
+        if (order.getStatus() == OrderStatus.CANCELLED) return OrderDto.fromEntity(order);
         // Customers can cancel pending orders only.
         if (order.getStatus() != OrderStatus.PENDING) throw invalidTransition();
         return OrderDto.fromEntity(moveTo(order, OrderStatus.CANCELLED, customerId));
@@ -111,7 +117,8 @@ public class OrderService {
     public OrderDto updateStatus(long employeeId, long orderId, OrderStatus next) {
         if (next == OrderStatus.PENDING)
             throw BusinessException.invalid("VALIDATION_ERROR", "Không thể chuyển đơn về PENDING.");
-        Order order = orders.findById(orderId).orElseThrow(OrderService::orderNotFound);
+        Order order = orders.findByIdForUpdate(orderId).orElseThrow(OrderService::orderNotFound);
+        if (next == OrderStatus.CANCELLED && order.getStatus() == next) return OrderDto.fromEntity(order);
         if (!canMove(order, next)) throw invalidTransition();
         return OrderDto.fromEntity(moveTo(order, next, employeeId));
     }
@@ -133,7 +140,8 @@ public class OrderService {
         Instant now = now();
         if (next == OrderStatus.CANCELLED) {
             // Restore reserved stock.
-            order.getItems().forEach(item -> foodService.releaseStock(item.getFoodId(), item.getQuantity()));
+            order.getItems().stream().sorted(Comparator.comparing(OrderItem::getFoodId))
+                    .forEach(item -> foodService.releaseStock(item.getFoodId(), item.getQuantity()));
             order.setCancelledAt(now);
         }
         if (next == OrderStatus.CONFIRMED) {

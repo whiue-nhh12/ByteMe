@@ -7,6 +7,10 @@ import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -21,12 +25,14 @@ import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.util.AopTestUtils;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.example.dto.AddToCartRequest;
+import org.example.dto.FoodRequest;
 import org.example.dto.UpdateCartItemRequest;
 import org.example.service.CartService;
 import org.example.common.BusinessException;
 import org.example.dto.CreateOrderRequest;
 import org.example.entity.*;
 import org.example.service.OrderService;
+import org.example.service.FoodService;
 import org.example.shared.api.Role;
 import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -55,6 +61,7 @@ class OrderIntegrationTest {
 
     @Autowired JdbcTemplate db;
     @Autowired OrderService service;
+    @Autowired FoodService foodService;
     @Autowired TransactionTemplate transactions;
     @MockitoSpyBean CartService carts;
 
@@ -67,6 +74,91 @@ class OrderIntegrationTest {
 
     private CartService cartTarget() {
         return AopTestUtils.getUltimateTargetObject(carts);
+    }
+
+    @Test void concurrentCustomersCannotBothBuyTheLastUnit() throws Exception {
+        db.update("DELETE FROM cart_items WHERE cart_id IN (1, 2)");
+        db.update("INSERT INTO cart_items (cart_id, food_id, quantity) VALUES (1, 1, 1), (2, 1, 1)");
+        db.update("UPDATE foods SET stock_quantity = 1 WHERE id = 1");
+
+        var results = race(() -> checkoutResult(4), () -> checkoutResult(5));
+
+        assertEquals(List.of("CREATED", "INSUFFICIENT_STOCK"), results.stream().sorted().toList());
+        assertEquals(0, stock(1));
+        assertEquals(1, db.queryForObject("SELECT SUM(quantity) FROM order_items WHERE order_id > 1008", Integer.class));
+        assertEquals(1, db.queryForObject("SELECT COUNT(*) FROM cart_items WHERE cart_id IN (1, 2)", Integer.class));
+    }
+
+    @Test void checkoutAndAddCanOnlyConsumeTheCartInAValidOrder() throws Exception {
+        db.update("DELETE FROM cart_items WHERE cart_id = 1 AND food_id <> 1");
+        int before = stock(1);
+
+        var placed = race(() -> service.create(CUSTOMER, dineIn()).items().getFirst().quantity(), () -> {
+            carts.addToCart(CUSTOMER, add(1, 1));
+            return 0;
+        }).getFirst();
+
+        var remaining = db.queryForObject(
+                "SELECT COALESCE(SUM(quantity), 0) FROM cart_items WHERE cart_id = 1", Integer.class);
+        assertEquals(3, placed + remaining);
+        assertEquals(before - placed, stock(1));
+    }
+
+    @Test void adminEditWithoutStockKeepsTheCommittedDeduction() throws Exception {
+        int before = stock(1);
+        var request = new FoodRequest(1L, "Tên mới của phở", null, new BigDecimal("70000"),
+                null, null, null);
+
+        var unitPrice = race(() -> service.create(CUSTOMER, dineIn()).items().getFirst().unitPrice(), () -> {
+            foodService.updateFood(1L, request);
+            return BigDecimal.ZERO;
+        }).getFirst();
+
+        assertTrue(List.of(new BigDecimal("65000.00"), new BigDecimal("70000.00")).contains(unitPrice));
+        assertEquals(before - 2, stock(1));
+        assertEquals(request.name(), db.queryForObject("SELECT name FROM foods WHERE id = 1", String.class));
+    }
+
+    @Test void concurrentCustomerAndEmployeeCancellationRestoreStockOnce() throws Exception {
+        int beforeFood1 = stock(1);
+        int beforeFood5 = stock(5);
+
+        var results = race(() -> service.cancel(CUSTOMER, 1001),
+                () -> service.updateStatus(EMPLOYEE, 1001, OrderStatus.CANCELLED));
+
+        assertEquals(results.getFirst(), results.getLast());
+        assertEquals(OrderStatus.CANCELLED, results.getFirst().status());
+        assertEquals(beforeFood1 + 2, stock(1));
+        assertEquals(beforeFood5 + 2, stock(5));
+    }
+
+    private String checkoutResult(long customerId) {
+        try {
+            service.create(customerId, dineIn());
+            return "CREATED";
+        } catch (BusinessException error) {
+            return error.code();
+        }
+    }
+
+    private static <T> List<T> race(Callable<T> first, Callable<T> second) throws Exception {
+        var start = new CyclicBarrier(2);
+        try (var workers = Executors.newVirtualThreadPerTaskExecutor()) {
+            var a = workers.submit(() -> {
+                start.await(5, TimeUnit.SECONDS);
+                return first.call();
+            });
+            var b = workers.submit(() -> {
+                start.await(5, TimeUnit.SECONDS);
+                return second.call();
+            });
+            try {
+                return List.of(a.get(15, TimeUnit.SECONDS), b.get(15, TimeUnit.SECONDS));
+            } finally {
+                a.cancel(true);
+                b.cancel(true);
+            }
+        }
     }
 
     @Test void checkoutPersistsSnapshotsUpdatesStockAndClearsCart() {
