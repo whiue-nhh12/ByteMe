@@ -8,9 +8,11 @@ import org.example.dto.UpdateCartItemRequest;
 import org.example.entity.Cart;
 import org.example.entity.CartItem;
 import org.example.repository.CartRepository;
+import org.example.repository.UserRepository;
 import org.example.common.BusinessException;
 import org.example.dto.FoodDto;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.LinkedHashMap;
@@ -24,6 +26,7 @@ public class CartService {
 
     private final CartRepository cartRepository;
     private final FoodService foodService;
+    private final UserRepository users;
 
     @Transactional(readOnly = true)
     public CartDto getCart(long userId) {
@@ -34,6 +37,7 @@ public class CartService {
 
     @Transactional
     public CartDto addToCart(long userId, AddToCartRequest request) {
+        lockCustomer(userId);
         Cart cart = cartRepository.findByUserId(userId)
                 .orElseGet(() -> cartRepository.save(Cart.builder().userId(userId).build()));
         FoodDto food = foodService.getAvailableFood(request.foodId());
@@ -64,6 +68,7 @@ public class CartService {
 
     @Transactional
     public CartDto updateCartItem(long userId, Long cartItemId, UpdateCartItemRequest request) {
+        lockCustomer(userId);
         Cart cart = cartRepository.findByUserId(userId).orElseThrow(CartService::cartItemNotFound);
 
         CartItem cartItem = cart.getItems().stream()
@@ -78,6 +83,7 @@ public class CartService {
 
     @Transactional
     public CartDto removeCartItem(long userId, Long cartItemId) {
+        lockCustomer(userId);
         Cart cart = cartRepository.findByUserId(userId).orElseThrow(CartService::cartItemNotFound);
 
         boolean removed = cart.getItems().removeIf(item -> item.getId().equals(cartItemId));
@@ -90,8 +96,9 @@ public class CartService {
     }
 
 
-    @Transactional(readOnly = true)
+    @Transactional(propagation = Propagation.MANDATORY)
     public Map<Long, Integer> getItemsForCheckout(long userId) {
+        lockCustomer(userId);
         Map<Long, Integer> items = new LinkedHashMap<>();
         cartRepository.findByUserId(userId).ifPresent(cart ->
                 cart.getItems().forEach(item -> items.put(item.getFoodId(), item.getQuantity())));
@@ -100,10 +107,16 @@ public class CartService {
 
     @Transactional
     public void clearCart(long userId) {
+        lockCustomer(userId);
         cartRepository.findByUserId(userId).ifPresent(cart -> {
             cart.getItems().clear();
             cartRepository.saveChanges(cart);
         });
+    }
+
+    private void lockCustomer(long userId) {
+        // The user row exists even when the customer has no cart yet.
+        users.lockById(userId).orElseThrow(() -> BusinessException.forbidden("FORBIDDEN", "Không tìm thấy tài khoản."));
     }
 
     private CartDto toCartDto(Cart cart) {
