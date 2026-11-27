@@ -416,12 +416,37 @@ paths:
         Món không tồn tại trả 404 FOOD_NOT_FOUND, INACTIVE trả 409 FOOD_UNAVAILABLE,
         thiếu kho trả 409 INSUFFICIENT_STOCK. Không có phí giao hàng/thuế trong tổng.
         paymentMethod chỉ ghi nhận phương thức, không thực hiện thanh toán.
-        Chưa có idempotency key: gửi lại sau khi giỏ đã dọn trả EMPTY_CART.
         Checkout và mọi thao tác ghi giỏ của cùng khách dùng chung khóa hàng.
         Deadlock/hết thời gian chờ khóa trả 409 CONCURRENT_UPDATE;
         server không tự retry.
+
+        Idempotency-Key (tùy chọn, Pha 2): client tạo một key cho mỗi ý định đặt
+        hàng và dùng lại đúng key đó khi retry. Key thuộc phạm vi khách trong JWT.
+        Không gửi header giữ hành vi cũ (gửi lại sau khi giỏ đã dọn trả EMPTY_CART).
+        Key sai định dạng trả 400 INVALID_IDEMPOTENCY_KEY trước khi đọc DB.
+        Cùng key + cùng payload (sau khi trim/chuẩn hóa theo orderType) đã thành công:
+        trả lại 201, Location và đúng body OrderDto lần đầu; không đọc giỏ, không trừ
+        kho, không tạo đơn mới, kể cả khi giỏ đã đổi hoặc đơn đã bị hủy sau đó (GET
+        đơn để xem trạng thái hiện tại). Cùng key + payload khác: 409
+        IDEMPOTENCY_KEY_REUSED, không thay đổi đơn/kho/giỏ. Nhiều request cùng key
+        đến đồng thời được tuần tự hóa: chỉ một request tạo đơn, các request còn lại
+        nhận cùng kết quả (hoặc 409 CONCURRENT_UPDATE nếu khóa hết thời gian chờ,
+        retry an toàn). Key chỉ được lưu cùng transaction của đơn thành công; checkout
+        lỗi (EMPTY_CART, INSUFFICIENT_STOCK...) không lưu key nên có thể thử lại cùng key.
+        Muốn đặt giỏ mới phải dùng key mới.
       security:
         - bearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: 1–64 ký tự thuộc [A-Za-z0-9._-], phân biệt hoa thường; ví dụ UUID.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+            pattern: '^[A-Za-z0-9._-]{1,64}$'
+          example: 3f2b7c1e-9a4d-4c1b-8f0e-2d6a5b7c9e10
       requestBody:
         required: true
         content:
@@ -817,6 +842,7 @@ components:
         ACCOUNT_CONFLICT (đăng ký), FOOD_NAME_CONFLICT (tạo/sửa món),
         FOOD_UNAVAILABLE (thêm giỏ/checkout), INSUFFICIENT_STOCK (checkout),
         INVALID_ORDER_TRANSITION (xử lý đơn), STOCK_RESTORE_CONFLICT (hoàn kho vượt giới hạn),
+        IDEMPOTENCY_KEY_REUSED (checkout: Idempotency-Key đã dùng cho payload khác),
         CONFLICT (ràng buộc DB, gồm UNIQUE/FK/CHECK),
         CONCURRENT_UPDATE (deadlock/hết thời gian chờ khóa; transaction rollback,
         có thể gửi lại; server không tự retry).
