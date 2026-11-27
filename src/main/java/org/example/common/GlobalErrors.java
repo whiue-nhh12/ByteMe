@@ -58,7 +58,11 @@ public class GlobalErrors {
 
     @ExceptionHandler(DataIntegrityViolationException.class)
     ResponseEntity<ApiError> integrity(DataIntegrityViolationException e, HttpServletRequest r) {
-        log.warn("Vi phạm ràng buộc dữ liệu tại {}: {}", r.getRequestURI(), e.getMostSpecificCause().getMessage());
+        String cause = String.valueOf(e.getMostSpecificCause().getMessage());
+        log.warn("Vi phạm ràng buộc dữ liệu tại {}: {}", r.getRequestURI(), cause);
+        // Two checkouts raced on one Idempotency-Key past the customer lock: the loser rolled back, retry replays.
+        if (cause.contains("uq_checkout_idempotency_user_key"))
+            return error(r, 409, "CONCURRENT_UPDATE", "Yêu cầu cùng Idempotency-Key đang được xử lý, vui lòng thử lại.");
         return error(r, 409, "CONFLICT", "Dữ liệu trùng hoặc vi phạm ràng buộc.");
     }
 

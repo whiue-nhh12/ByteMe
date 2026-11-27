@@ -28,9 +28,10 @@ public class OrderController {
 
     @PostMapping
     public ResponseEntity<OrderDto> create(@AuthenticationPrincipal AuthenticatedUser user,
+            @RequestHeader(name = "Idempotency-Key", required = false) String idempotencyKey,
             @Valid @RequestBody CreateOrderRequest request) {
-        // Use the authenticated customer's ID.
-        OrderDto order = orderService.create(CurrentUser.id(user), request);
+        // Use the authenticated customer's ID; a replayed key returns the stored order with the same 201.
+        OrderDto order = orderService.create(CurrentUser.id(user), request, idempotencyKey);
         // Return the new order's location.
         return ResponseEntity.created(URI.create("/api/orders/" + order.id()))
                 .cacheControl(CacheControl.noStore()).body(order);

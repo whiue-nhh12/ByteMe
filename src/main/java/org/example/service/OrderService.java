@@ -19,6 +19,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 @Service
 @RequiredArgsConstructor
@@ -30,12 +31,29 @@ public class OrderService {
     private final OrderRepository orders;
     private final CartService cartService;
     private final FoodService foodService;
+    private final CheckoutIdempotencyService idempotency;
     private final Clock clock;
 
-    // Checkout runs atomically.
+    // Checkout without Idempotency-Key (phase 1 contract).
     @Transactional
     public OrderDto create(long customerId, CreateOrderRequest request) {
+        return create(customerId, request, null);
+    }
+
+    // Checkout runs atomically. With a key, the order, stock changes, cart clearing and the key record
+    // commit together; a retry with the same key and payload replays the first response instead.
+    @Transactional
+    public OrderDto create(long customerId, CreateOrderRequest request, String idempotencyKey) {
+        String key = CheckoutIdempotencyService.normalizeKey(idempotencyKey);
         CreateOrderRequest input = applyOrderTypeRules(request);
+        String requestHash = null;
+        if (key != null) {
+            requestHash = CheckoutIdempotencyService.fingerprint(input);
+            // Serialize with other checkouts/cart writes of this customer before looking the key up.
+            cartService.lockForCheckout(customerId);
+            Optional<OrderDto> replay = idempotency.findReplay(customerId, key, requestHash);
+            if (replay.isPresent()) return replay.get();
+        }
         Map<Long, Integer> cart = cartService.getItemsForCheckout(customerId);
         if (cart.isEmpty()) throw BusinessException.invalid("EMPTY_CART", "Giỏ hàng đang rỗng.");
 
@@ -70,7 +88,9 @@ public class OrderService {
         Order saved = orders.save(order);
         // Clear the cart after saving.
         cartService.clearCart(customerId);
-        return OrderDto.fromEntity(saved);
+        OrderDto result = OrderDto.fromEntity(saved);
+        if (key != null) idempotency.remember(customerId, key, requestHash, result);
+        return result;
     }
 
     @Transactional(readOnly = true)

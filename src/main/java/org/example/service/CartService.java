@@ -114,6 +114,12 @@ public class CartService {
         });
     }
 
+    // Checkout takes the same per-customer lock before reading its idempotency record.
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void lockForCheckout(long userId) {
+        lockCustomer(userId);
+    }
+
     private void lockCustomer(long userId) {
         // The user row exists even when the customer has no cart yet.
         users.lockById(userId).orElseThrow(() -> BusinessException.forbidden("FORBIDDEN", "Không tìm thấy tài khoản."));
