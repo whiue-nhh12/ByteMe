@@ -77,7 +77,7 @@ class OrderWebTest {
     }
 
     @Test void creationReturnsLocationAndServerCalculatedSnapshot() throws Exception {
-        when(service.create(anyLong(), any())).thenReturn(order(OrderType.DINE_IN, OrderStatus.PENDING));
+        when(service.create(anyLong(), any(), any())).thenReturn(order(OrderType.DINE_IN, OrderStatus.PENDING));
         http.perform(post("/api/orders").header("Authorization", "Bearer customer").contentType("application/json")
                 .content("{\"orderType\":\"DINE_IN\",\"tableNumber\":\"B05\",\"paymentMethod\":\"CASH\"}"))
                 .andExpect(status().isCreated()).andExpect(header().string("Location", "/api/orders/1001"))
@@ -88,7 +88,38 @@ class OrderWebTest {
                 .andExpect(jsonPath("$.createdAt").value("2026-10-08T01:58:00Z"))
                 .andExpect(jsonPath("$.userId").value(4)).andExpect(jsonPath("$.tableNumber").value("B05"));
         verify(service).create(eq(4L), eq(new org.example.dto.CreateOrderRequest(
-                OrderType.DINE_IN, "B05", null, null, null, PaymentMethod.CASH, null)));
+                OrderType.DINE_IN, "B05", null, null, null, PaymentMethod.CASH, null)), isNull());
+    }
+
+    @Test void idempotencyKeyHeaderIsPassedToTheService() throws Exception {
+        when(service.create(anyLong(), any(), any())).thenReturn(order(OrderType.DINE_IN, OrderStatus.PENDING));
+        http.perform(post("/api/orders").header("Authorization", "Bearer customer")
+                        .header("Idempotency-Key", "checkout-42").contentType("application/json")
+                        .content("{\"orderType\":\"DINE_IN\",\"tableNumber\":\"B05\",\"paymentMethod\":\"CASH\"}"))
+                .andExpect(status().isCreated()).andExpect(header().string("Location", "/api/orders/1001"));
+        verify(service).create(eq(4L), any(), eq("checkout-42"));
+    }
+
+    @Test void idempotencyErrorsAreExplicit() throws Exception {
+        for (var error : List.of(BusinessException.invalid("INVALID_IDEMPOTENCY_KEY", "bad key"),
+                BusinessException.conflict("IDEMPOTENCY_KEY_REUSED", "reused"))) {
+            doThrow(error).when(service).create(anyLong(), any(), any());
+            http.perform(post("/api/orders").header("Authorization", "Bearer customer")
+                            .header("Idempotency-Key", "k").contentType("application/json")
+                            .content("{\"orderType\":\"DINE_IN\",\"tableNumber\":\"B05\",\"paymentMethod\":\"CASH\"}"))
+                    .andExpect(status().is(error.type() == BusinessException.Type.INVALID ? 400 : 409))
+                    .andExpect(jsonPath("$.code").value(error.code()));
+        }
+    }
+
+    @Test void duplicateIdempotencyRowIsRetryable409() throws Exception {
+        doThrow(new org.springframework.dao.DataIntegrityViolationException("dup",
+                new RuntimeException("Duplicate entry '4-k' for key 'checkout_idempotency.uq_checkout_idempotency_user_key'")))
+                .when(service).create(anyLong(), any(), any());
+        http.perform(post("/api/orders").header("Authorization", "Bearer customer")
+                        .header("Idempotency-Key", "k").contentType("application/json")
+                        .content("{\"orderType\":\"DINE_IN\",\"tableNumber\":\"B05\",\"paymentMethod\":\"CASH\"}"))
+                .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("CONCURRENT_UPDATE"));
     }
 
     @Test void listAndDetailReturnPageAndSnapshot() throws Exception {
@@ -128,7 +159,7 @@ class OrderWebTest {
     }
 
     @Test void businessFailuresHaveExplicitJsonStatus() throws Exception {
-        when(service.create(anyLong(), any())).thenThrow(BusinessException.invalid("EMPTY_CART", "Giỏ hàng đang rỗng."));
+        when(service.create(anyLong(), any(), any())).thenThrow(BusinessException.invalid("EMPTY_CART", "Giỏ hàng đang rỗng."));
         http.perform(post("/api/orders").header("Authorization", "Bearer customer")
                 .contentType("application/json")
                 .content("{\"orderType\":\"DINE_IN\",\"tableNumber\":\"B05\",\"paymentMethod\":\"CASH\"}"))
@@ -155,7 +186,7 @@ class OrderWebTest {
     @Test void lockConflictsAre409RetryableInsteadOf500() throws Exception {
         for (var error : List.of(new CannotAcquireLockException("Deadlock found when trying to get lock"),
                 new PessimisticLockingFailureException("Lock wait timeout exceeded"))) {
-            doThrow(error).when(service).create(anyLong(), any());
+            doThrow(error).when(service).create(anyLong(), any(), any());
             http.perform(post("/api/orders").header("Authorization", "Bearer customer")
                     .contentType("application/json")
                     .content("{\"orderType\":\"DINE_IN\",\"tableNumber\":\"B05\",\"paymentMethod\":\"CASH\"}"))

@@ -66,7 +66,7 @@ class OrderIntegrationTest {
     @MockitoSpyBean CartService carts;
 
     @BeforeEach void seed() {
-        for (String table : List.of("order_items", "orders", "cart_items", "carts", "foods", "categories", "users"))
+        for (String table : List.of("checkout_idempotency", "order_items", "orders", "cart_items", "carts", "foods", "categories", "users"))
             db.update("DELETE FROM " + table);
         new ResourceDatabasePopulator(new ClassPathResource("db/seed.sql"))
                 .execute(Objects.requireNonNull(db.getDataSource()));
@@ -383,5 +383,134 @@ class OrderIntegrationTest {
     private BigDecimal total(long orderId) {
         return db.queryForObject("SELECT COALESCE(SUM(unit_price * quantity), 0) FROM order_items WHERE order_id = ?",
                 BigDecimal.class, orderId);
+    }
+
+    // ---- Idempotency-Key (plan section 2.4 and test matrix cases 2, 3, 4)
+
+    private int orderCount() { return db.queryForObject("SELECT COUNT(*) FROM orders", Integer.class); }
+
+    private int keyRows(long userId) {
+        return db.queryForObject("SELECT COUNT(*) FROM checkout_idempotency WHERE user_id = ?", Integer.class, userId);
+    }
+
+    @Test void sequentialRetryWithSameKeyAndPayloadCreatesOneOrder() {
+        int stock1 = stock(1);
+        var first = service.create(CUSTOMER, dineIn(), "retry-1");
+        var second = service.create(CUSTOMER, dineIn(), "retry-1");
+        var third = service.create(CUSTOMER, dineIn(), "retry-1");
+
+        assertEquals(first, second);
+        assertEquals(first, third);
+        assertEquals(9, orderCount());
+        assertEquals(stock1 - 2, stock(1));
+        assertEquals(1, keyRows(CUSTOMER));
+    }
+
+    @Test void concurrentRequestsWithSameKeyCreateOneOrderAndAllGetIt() throws Exception {
+        int stock1 = stock(1);
+        int stock14 = stock(14);
+        int workers = 8;
+        var start = new CyclicBarrier(workers);
+        List<java.util.concurrent.Future<Object>> futures = new java.util.ArrayList<>();
+        try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int i = 0; i < workers; i++) futures.add(pool.submit(() -> {
+                start.await(5, TimeUnit.SECONDS);
+                try {
+                    return service.create(CUSTOMER, dineIn(), "same-intent");
+                } catch (BusinessException error) {
+                    return error.code();
+                }
+            }));
+            List<Object> results = new java.util.ArrayList<>();
+            for (var future : futures) results.add(future.get(30, TimeUnit.SECONDS));
+
+            assertTrue(results.stream().allMatch(r -> r instanceof org.example.dto.OrderDto), results.toString());
+            assertEquals(1, results.stream().map(r -> ((org.example.dto.OrderDto) r).id()).distinct().count());
+        }
+        assertEquals(9, orderCount());
+        assertEquals(stock1 - 2, stock(1));
+        assertEquals(stock14 - 2, stock(14));
+        assertEquals(1, keyRows(CUSTOMER));
+    }
+
+    @Test void reusingKeyWithDifferentPayloadIsRejectedAndChangesNothing() {
+        var first = service.create(CUSTOMER, dineIn(), "reuse-1");
+        carts.addToCart(CUSTOMER, add(5, 1));
+        int stock5 = stock(5);
+        int cartItems = db.queryForObject("SELECT COUNT(*) FROM cart_items WHERE cart_id = 1", Integer.class);
+
+        for (var changed : List.of(
+                new CreateOrderRequest(OrderType.DINE_IN, "B06", null, null, null, PaymentMethod.CASH, "Ít cay"),
+                new CreateOrderRequest(OrderType.DINE_IN, "B05", null, null, null, PaymentMethod.BANK_TRANSFER, "Ít cay"),
+                new CreateOrderRequest(OrderType.DINE_IN, "B05", null, null, null, PaymentMethod.CASH, "Không hành"),
+                new CreateOrderRequest(OrderType.DELIVERY, null, "Khách", "0900000004", "Địa chỉ", PaymentMethod.COD, null)))
+            assertCode("IDEMPOTENCY_KEY_REUSED", () -> service.create(CUSTOMER, changed, "reuse-1"));
+
+        assertEquals(9, orderCount());
+        assertEquals(stock5, stock(5));
+        assertEquals(cartItems, db.queryForObject("SELECT COUNT(*) FROM cart_items WHERE cart_id = 1", Integer.class));
+        assertEquals(OrderStatus.PENDING, service.get(CUSTOMER, Role.CUSTOMER, first.id()).status());
+    }
+
+    @Test void retryAfterLostResponseReturnsCommittedOrderEvenIfCartChanged() {
+        var committed = service.create(CUSTOMER, dineIn(), "lost-response");
+        // The client never saw the 201, keeps shopping, then retries the same intent.
+        carts.addToCart(CUSTOMER, add(5, 2));
+        int stock5 = stock(5);
+
+        var retried = service.create(CUSTOMER, dineIn(), "lost-response");
+
+        assertEquals(committed, retried);
+        assertEquals(9, orderCount());
+        assertEquals(stock5, stock(5));
+        assertEquals(1, db.queryForObject("SELECT COUNT(*) FROM cart_items WHERE cart_id = 1", Integer.class));
+    }
+
+    @Test void replayReturnsOriginalResponseAfterCancellation() {
+        var created = service.create(CUSTOMER, dineIn(), "then-cancel");
+        service.cancel(CUSTOMER, created.id());
+        var replay = service.create(CUSTOMER, dineIn(), "then-cancel");
+        assertEquals(created, replay);
+        assertEquals(OrderStatus.PENDING, replay.status());
+        assertEquals(OrderStatus.CANCELLED, service.get(CUSTOMER, Role.CUSTOMER, created.id()).status());
+    }
+
+    @Test void failedCheckoutDoesNotStoreKeySoTheSameKeyCanSucceedLater() {
+        db.update("UPDATE foods SET stock_quantity = 0 WHERE id = 14");
+        assertCode("INSUFFICIENT_STOCK", () -> service.create(CUSTOMER, dineIn(), "after-restock"));
+        assertEquals(0, keyRows(CUSTOMER));
+        assertEquals(8, orderCount());
+
+        db.update("UPDATE foods SET stock_quantity = 5 WHERE id = 14");
+        var order = service.create(CUSTOMER, dineIn(), "after-restock");
+        assertEquals(1, keyRows(CUSTOMER));
+        assertEquals(order, service.create(CUSTOMER, dineIn(), "after-restock"));
+    }
+
+    @Test void failureAfterStoringKeyRollsBackOrderStockCartAndKey() {
+        int stock1 = stock(1);
+        assertThrows(IllegalStateException.class, () -> transactions.executeWithoutResult(status -> {
+            service.create(CUSTOMER, dineIn(), "rollback-1");
+            throw new IllegalStateException("Synthetic failure before commit");
+        }));
+        assertEquals(0, keyRows(CUSTOMER));
+        assertEquals(8, orderCount());
+        assertEquals(stock1, stock(1));
+        assertEquals(3, db.queryForObject("SELECT COUNT(*) FROM cart_items WHERE cart_id = 1", Integer.class));
+    }
+
+    @Test void sameKeyForDifferentCustomersIsIndependent() {
+        var mine = service.create(CUSTOMER, dineIn(), "shared-key");
+        var theirs = service.create(5, dineIn(), "shared-key");
+        assertNotEquals(mine.id(), theirs.id());
+        assertEquals(5L, theirs.userId());
+        assertEquals(10, orderCount());
+    }
+
+    @Test void invalidKeyIsRejectedWithoutWrites() {
+        int stock1 = stock(1);
+        assertCode("INVALID_IDEMPOTENCY_KEY", () -> service.create(CUSTOMER, dineIn(), "has space"));
+        assertEquals(stock1, stock(1));
+        assertEquals(8, orderCount());
     }
 }

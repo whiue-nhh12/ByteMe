@@ -16,7 +16,10 @@ import org.example.dto.FoodDto;
 import org.example.service.FoodService;
 import org.example.dto.*;
 import org.example.entity.*;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.example.repository.CheckoutIdempotencyRepository;
 import org.example.repository.OrderRepository;
+import org.example.service.CheckoutIdempotencyService;
 import org.example.service.OrderService;
 import org.example.shared.api.Role;
 import static org.junit.jupiter.api.Assertions.*;
@@ -30,13 +33,16 @@ class OrderServiceTest {
     OrderRepository orders;
     CartService carts;
     FoodService foods;
+    CheckoutIdempotencyRepository keys;
     OrderService service;
 
     @BeforeEach void setUp() {
         orders = mock(OrderRepository.class);
         carts = mock(CartService.class);
         foods = mock(FoodService.class);
-        service = new OrderService(orders, carts, foods, Clock.fixed(NOW, ZoneOffset.UTC));
+        keys = mock(CheckoutIdempotencyRepository.class);
+        var idempotency = new CheckoutIdempotencyService(keys, new ObjectMapper().findAndRegisterModules());
+        service = new OrderService(orders, carts, foods, idempotency, Clock.fixed(NOW, ZoneOffset.UTC));
     }
 
     static CreateOrderRequest dineIn() {
@@ -264,5 +270,89 @@ class OrderServiceTest {
             assertCode("INVALID_ORDER_TRANSITION", () -> service.cancel(CUSTOMER, 1001));
         }
         verify(foods, times(1)).releaseStock(1, 2);
+    }
+
+    static CheckoutIdempotencyRepository.StoredCheckout stored(String hash, String json) {
+        return new CheckoutIdempotencyRepository.StoredCheckout() {
+            public String getRequestHash() { return hash; }
+            public String getResponseJson() { return json; }
+        };
+    }
+
+    @Test void malformedIdempotencyKeyIsRejectedBeforeTouchingTheDatabase() {
+        for (String key : List.of("", " ", "a b", "khóa", "x".repeat(65), "k\n"))
+            assertCode("INVALID_IDEMPOTENCY_KEY", () -> service.create(CUSTOMER, dineIn(), key));
+        verifyNoInteractions(carts, foods, orders, keys);
+    }
+
+    @Test void fingerprintIgnoresWhitespaceButNotCheckoutFields() {
+        String base = CheckoutIdempotencyService.fingerprint(
+                new CreateOrderRequest(OrderType.DINE_IN, "B05", null, null, null, PaymentMethod.CASH, "Ít cay"));
+        assertEquals(64, base.length());
+        assertNotEquals(base, CheckoutIdempotencyService.fingerprint(
+                new CreateOrderRequest(OrderType.DINE_IN, "B06", null, null, null, PaymentMethod.CASH, "Ít cay")));
+        assertNotEquals(base, CheckoutIdempotencyService.fingerprint(
+                new CreateOrderRequest(OrderType.DINE_IN, "B05", null, null, null, PaymentMethod.BANK_TRANSFER, "Ít cay")));
+        assertNotEquals(base, CheckoutIdempotencyService.fingerprint(
+                new CreateOrderRequest(OrderType.DINE_IN, "B05", null, null, null, PaymentMethod.CASH, null)));
+        // Field boundaries are length-prefixed, so moving text between fields changes the hash.
+        assertNotEquals(CheckoutIdempotencyService.fingerprint(
+                        new CreateOrderRequest(OrderType.DELIVERY, null, "ab", "c", "d", PaymentMethod.COD, null)),
+                CheckoutIdempotencyService.fingerprint(
+                        new CreateOrderRequest(OrderType.DELIVERY, null, "a", "bc", "d", PaymentMethod.COD, null)));
+    }
+
+    @Test void newKeyStoresTheResponseInTheCheckoutTransaction() {
+        var cart = new LinkedHashMap<Long, Integer>();
+        cart.put(1L, 2);
+        when(carts.getItemsForCheckout(4)).thenReturn(cart);
+        when(foods.reserveStock(1, 2)).thenReturn(food(1, "Phở", "65000.00"));
+        when(orders.save(any())).thenAnswer(call -> {
+            Order input = call.getArgument(0);
+            input.setId(1010L);
+            return input;
+        });
+        when(keys.find(4, "key-1")).thenReturn(Optional.empty());
+
+        var result = service.create(CUSTOMER, dineIn(), "key-1");
+
+        var order = inOrder(carts, keys);
+        order.verify(carts).lockForCheckout(4);
+        order.verify(keys).find(4, "key-1");
+        order.verify(carts).clearCart(4);
+        order.verify(keys).insert(eq(4L), eq("key-1"), eq(CheckoutIdempotencyService.fingerprint(
+                new CreateOrderRequest(OrderType.DINE_IN, "B05", null, null, null, PaymentMethod.CASH, "Ít cay"))),
+                eq(1010L), contains("\"id\":1010"));
+        assertEquals(1010L, result.id());
+    }
+
+    @Test void sameKeyAndPayloadReplaysStoredResponseWithoutTouchingCartOrStock() throws Exception {
+        var original = OrderDto.fromEntity(order(OrderType.DINE_IN, OrderStatus.PENDING));
+        String hash = CheckoutIdempotencyService.fingerprint(
+                new CreateOrderRequest(OrderType.DINE_IN, "B05", null, null, null, PaymentMethod.CASH, "Ít cay"));
+        when(keys.find(4, "key-1")).thenReturn(Optional.of(stored(hash,
+                new ObjectMapper().findAndRegisterModules().writeValueAsString(original))));
+
+        assertEquals(original, service.create(CUSTOMER, dineIn(), "key-1"));
+        verify(carts).lockForCheckout(4);
+        verify(carts, never()).getItemsForCheckout(anyLong());
+        verify(carts, never()).clearCart(anyLong());
+        verifyNoInteractions(foods, orders);
+        verify(keys, never()).insert(anyLong(), any(), any(), anyLong(), any());
+    }
+
+    @Test void sameKeyWithDifferentPayloadIsRejected() {
+        when(keys.find(4, "key-1")).thenReturn(Optional.of(stored("0".repeat(64), "{}")));
+        assertCode("IDEMPOTENCY_KEY_REUSED", () -> service.create(CUSTOMER, dineIn(), "key-1"));
+        verify(carts, never()).getItemsForCheckout(anyLong());
+        verifyNoInteractions(foods, orders);
+        verify(keys, never()).insert(anyLong(), any(), any(), anyLong(), any());
+    }
+
+    @Test void checkoutWithoutKeyKeepsPhaseOneFlow() {
+        when(carts.getItemsForCheckout(4)).thenReturn(Map.of());
+        assertCode("EMPTY_CART", () -> service.create(CUSTOMER, dineIn(), null));
+        verify(carts, never()).lockForCheckout(anyLong());
+        verifyNoInteractions(keys);
     }
 }
