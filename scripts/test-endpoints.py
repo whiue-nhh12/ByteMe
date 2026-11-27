@@ -76,7 +76,7 @@ def http(name, method, path, expected, body=None, token=None, code=None, **kwarg
 
 
 def state():
-    tables = ["users", "categories", "foods", "carts", "cart_items", "orders", "order_items"]
+    tables = ["users", "categories", "foods", "carts", "cart_items", "orders", "order_items", "checkout_idempotency"]
     return {table: int(sql(f"SELECT COUNT(*) FROM {table}")) for table in tables} | {
         "stock_total": int(sql("SELECT COALESCE(SUM(stock_quantity), 0) FROM foods"))}
 
@@ -297,6 +297,27 @@ def run():
     check("Cancellation restores stock", stock(primary) == 20, 20, stock(primary))
     http("Repeated cancellation returns the cancelled order", "DELETE", f"/api/orders/{order_id}", 200, token=TOKENS["a"])
     check("Cancellation cannot restore twice", stock(primary) == 20, 20, stock(primary))
+    GROUP = "Idempotency"
+    key = {"Idempotency-Key": RUN + "-checkout-1"}
+    add("a", primary, 1)
+    http("Reject malformed Idempotency-Key", "POST", "/api/orders", 400, DINE, TOKENS["a"],
+         code="INVALID_IDEMPOTENCY_KEY", headers={"Idempotency-Key": "has space"})
+    created, headers = http("Checkout with new key", "POST", "/api/orders", 201, DINE, TOKENS["a"], headers=key)
+    check("Keyed checkout decreases stock once", stock(primary) == 19, 19, stock(primary))
+    replay, replay_headers = http("Retry same key and payload", "POST", "/api/orders", 201, DINE, TOKENS["a"], headers=key)
+    check("Retry returns the same order", replay == created, created.get("id"), replay.get("id") if replay else None)
+    check("Retry keeps Location", replay_headers.get("Location") == headers.get("Location"),
+          headers.get("Location"), replay_headers.get("Location"))
+    check("Retry does not decrease stock again", stock(primary) == 19, 19, stock(primary))
+    http("Same key with different payload", "POST", "/api/orders", 409, DELIVERY, TOKENS["a"],
+         code="IDEMPOTENCY_KEY_REUSED", headers=key)
+    keyed_orders = int(sql(f"SELECT COUNT(*) FROM orders WHERE user_id = {int(USERS['a'])} AND id >= {int(created['id'])}"))
+    check("Retries create one order", keyed_orders == 1, 1, keyed_orders)
+    http("Cancel keyed order", "DELETE", f"/api/orders/{created['id']}", 200, token=TOKENS["a"])
+    replay, _ = http("Replay after cancellation", "POST", "/api/orders", 201, DINE, TOKENS["a"], headers=key)
+    check("Replay returns original checkout snapshot", replay.get("status") == "PENDING", "PENDING", replay.get("status"))
+    check("Keyed cancellation restores stock", stock(primary) == 20, 20, stock(primary))
+    GROUP = "Order"
     for serving in [DINE, DELIVERY]:
         clear("a")
         add("a", secondary)

@@ -2,7 +2,7 @@
 
 ## Trạng thái quyết định
 
-Đây là đề xuất thiết kế cụ thể để nhóm duyệt trước khi T03 trở đi sửa code. Các hợp đồng HTTP mới (Idempotency-Key bắt buộc, replay hủy là 200) cần được TV1/TV3 xác nhận và cập nhật OpenAPI trước khi tích hợp. Tài liệu giữ kiến trúc phân tầng hiện tại, một backend instance và MySQL InnoDB; chưa đề xuất thêm dịch vụ ngoài phạm vi.
+Phần idempotency đã được triển khai, xem `checkout-idempotency.md`. Đây là đề xuất thiết kế cụ thể để nhóm duyệt trước khi T03 trở đi sửa code. Các hợp đồng HTTP mới (Idempotency-Key bắt buộc, replay hủy là 200) cần được TV1/TV3 xác nhận và cập nhật OpenAPI trước khi tích hợp. Tài liệu giữ kiến trúc phân tầng hiện tại, một backend instance và MySQL InnoDB; chưa đề xuất thêm dịch vụ ngoài phạm vi.
 
 ## Mục tiêu và ngoài phạm vi
 
